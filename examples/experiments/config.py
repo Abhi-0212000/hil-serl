@@ -18,7 +18,8 @@ class DefaultTrainingConfig:
     steps_per_update: int = 50
 
     log_period: int = 10
-    eval_period: int = 2000
+    eval_period: int = 5000  # Periodic evaluation frequency (0 to disable)
+    eval_n_trajs: int = 5    # Number of trajectories for evaluation
 
     # "resnet" for ResNet10 from scratch and "resnet-pretrained" for frozen ResNet10 with pretrained weights
     encoder_type: str = "resnet-pretrained"
@@ -27,7 +28,6 @@ class DefaultTrainingConfig:
     buffer_period: int = 0
 
     eval_checkpoint_step: int = 0
-    eval_n_trajs: int = 5
 
     image_keys: List[str] = None
     classifier_keys: List[str] = None

@@ -58,12 +58,36 @@ class BCAgent(flax.struct.PyTreeNode):
             else:
                 batch_actions = batch["actions"]
             log_probs = dist.log_prob(batch_actions)
+            pi_actions = dist.mode()  # Predicted actions from policy
+            # Example: pi_actions and batch_actions have shape [128, 14]
+            #   128 = batch size
+            #   14  = action dimension
+            #
+            # Step-by-step:
+            #   (pi_actions - batch_actions)      → shape [128, 14], elementwise differences
+            #   ( ... ) ** 2                      → shape [128, 14], squared differences
+            #   .sum(-1)                          → shape [128], sum over last dim (14)
+            #
+            # Result: one scalar error per sample in the batch (128 values total)
             mse = ((pi_actions - batch_actions) ** 2).sum(-1)
             actor_loss = -(log_probs).mean()
 
             return actor_loss, {
                 "actor_loss": actor_loss,
                 "mse": mse.mean(),
+                "pi_action_position_right": pi_actions[:, 7:10],
+                "pi_gripper_right_mean": pi_actions[:, 13].mean(),
+                "pi_gripper_right_min": pi_actions[:, 13].min(),
+                "pi_gripper_right_max": pi_actions[:, 13].max(),
+                "pi_action_position_left": pi_actions[:, :3],
+                "pi_gripper_left_mean": pi_actions[:, 6].mean(),
+                "pi_actions_min": pi_actions.min(),
+                "pi_actions_max": pi_actions.max(),
+                "log_probs_mean": log_probs.mean(),
+                "log_probs_min": log_probs.min(),
+                "log_probs_max": log_probs.max(),
+                "log_probs_has_nan": jnp.any(jnp.isnan(log_probs)),
+                "log_probs_has_inf": jnp.any(jnp.isinf(log_probs)),
             }
 
         # compute gradients and update params

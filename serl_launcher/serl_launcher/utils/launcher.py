@@ -35,7 +35,7 @@ def make_bc_agent(
             "dropout_rate": 0.25,
         },
         policy_kwargs={
-            "tanh_squash_distribution": False,
+            "tanh_squash_distribution": True,
             "std_parameterization": "exp",
             "std_min": 1e-5,
             "std_max": 5,
@@ -56,6 +56,8 @@ def make_sac_pixel_agent(
     reward_bias=0.0,
     target_entropy=None,
     discount=0.97,
+    critic_ensemble_size=5,
+    critic_subsample_size=2,
 ):
     agent = SACAgent.create_pixels(
         jax.random.PRNGKey(seed),
@@ -83,8 +85,8 @@ def make_sac_pixel_agent(
         temperature_init=1e-2,
         discount=discount,
         backup_entropy=False,
-        critic_ensemble_size=2,
-        critic_subsample_size=None,
+        critic_ensemble_size=critic_ensemble_size,
+        critic_subsample_size=critic_subsample_size,
         reward_bias=reward_bias,
         target_entropy=target_entropy,
         augmentation_function=make_batch_augmentation_func(image_keys),
@@ -163,7 +165,7 @@ def make_sac_pixel_agent_hybrid_dual_arm(
             "tanh_squash_distribution": True,
             "std_parameterization": "exp",
             "std_min": 1e-5,
-            "std_max": 5,
+            "std_max": 5.0,# UPDATED: Cap max noise at 1.0 (e^0). Was 5.0 (e^5 = 148.0), which guarantees edge-hitting.
         },
         critic_network_kwargs={
             "activations": nn.tanh,
@@ -180,11 +182,11 @@ def make_sac_pixel_agent_hybrid_dual_arm(
             "use_layer_norm": True,
             "hidden_dims": [256, 256],
         },
-        temperature_init=1e-2,
+        temperature_init=1e-4,
         discount=discount,
         backup_entropy=False,
-        critic_ensemble_size=2,
-        critic_subsample_size=None,
+        critic_ensemble_size=5,
+        critic_subsample_size=2,
         reward_bias=reward_bias,
         target_entropy=target_entropy,
         augmentation_function=make_batch_augmentation_func(image_keys),

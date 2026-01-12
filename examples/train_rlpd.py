@@ -2,6 +2,10 @@
 
 import glob
 import time
+import json
+from datetime import datetime
+from functools import partial
+from collections import defaultdict
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,10 +15,11 @@ from flax.training import checkpoints
 import os
 import copy
 import pickle as pkl
-from gymnasium.wrappers.record_episode_statistics import RecordEpisodeStatistics
 from natsort import natsorted
 
 from serl_launcher.agents.continuous.sac import SACAgent
+from serl_launcher.common.evaluation import evaluate
+from serl_launcher.utils.logging_utils import RecordEpisodeStatistics
 from serl_launcher.agents.continuous.sac_hybrid_single import SACAgentHybridSingleArm
 from serl_launcher.agents.continuous.sac_hybrid_dual import SACAgentHybridDualArm
 from serl_launcher.utils.timer_utils import Timer
@@ -32,7 +37,8 @@ from serl_launcher.utils.launcher import (
 )
 from serl_launcher.data.data_store import MemoryEfficientReplayBufferDataStore
 
-from experiments.mappings import CONFIG_MAPPING
+from experiments.mappings import get_config
+
 
 FLAGS = flags.FLAGS
 
@@ -44,8 +50,9 @@ flags.DEFINE_string("ip", "localhost", "IP address of the learner.")
 flags.DEFINE_multi_string("demo_path", None, "Path to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
-flags.DEFINE_integer("eval_n_trajs", 0, "Number of trajectories to evaluate.")
+flags.DEFINE_integer("eval_n_trajs", 5, "Number of trajectories to evaluate.")
 flags.DEFINE_boolean("save_video", False, "Save video.")
+flags.DEFINE_boolean("render", True, "Render the environment.")
 
 flags.DEFINE_boolean(
     "debug", False, "Debug mode."
@@ -67,6 +74,10 @@ def print_green(x):
 def actor(agent, data_store, intvn_data_store, env, sampling_rng):
     """
     This is the actor loop, which runs when "--actor" is set to True.
+    Features:
+    - Periodic evaluation with separate eval environment
+    - Detailed logging at log_period intervals
+    - Eval stats saved to JSON file
     """
     if FLAGS.eval_checkpoint_step:
         success_counter = 0
@@ -87,31 +98,33 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 sampling_rng, key = jax.random.split(sampling_rng)
                 actions = agent.sample_actions(
                     observations=jax.device_put(obs),
-                    argmax=False,
+                    argmax=True,  # Use argmax for evaluation
                     seed=key
                 )
-                actions = np.asarray(jax.device_get(actions))
+                actions = np.asarray(jax.device_get(actions), copy=True)
 
                 next_obs, reward, done, truncated, info = env.step(actions)
+                done = done or truncated
                 obs = next_obs
 
                 if done:
-                    if reward:
+                    is_success = info.get("is_success", False)
+                    if is_success:
                         dt = time.time() - start_time
                         time_list.append(dt)
-                        print(dt)
+                        print(f"Episode {episode + 1}: SUCCESS in {dt:.2f}s")
 
-                    success_counter += reward
-                    print(reward)
-                    print(f"{success_counter}/{episode + 1}")
+                    success_counter += int(is_success)
+                    print(f"Success rate so far: {success_counter}/{episode + 1}")
 
-        print(f"success rate: {success_counter / FLAGS.eval_n_trajs}")
-        print(f"average time: {np.mean(time_list)}")
+        print(f"\n🎯 Final success rate: {success_counter / FLAGS.eval_n_trajs:.1%}")
+        if time_list:
+            print(f"⏱️  Average success time: {np.mean(time_list):.2f}s")
         return  # after done eval, return and exit
     
     start_step = (
         int(os.path.basename(natsorted(glob.glob(os.path.join(FLAGS.checkpoint_path, "buffer/*.pkl")))[-1])[12:-4]) + 1
-        if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path)
+        if FLAGS.checkpoint_path and os.path.exists(FLAGS.checkpoint_path) and glob.glob(os.path.join(FLAGS.checkpoint_path, "buffer/*.pkl"))
         else 0
     )
 
@@ -136,15 +149,27 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
     client.recv_network_callback(update_params)
 
+    # Setup evaluation stats file
+    eval_stats_file = None
+    if FLAGS.checkpoint_path is not None:
+        os.makedirs(FLAGS.checkpoint_path, exist_ok=True)
+        eval_stats_file = os.path.join(FLAGS.checkpoint_path, "eval_stats.json")
+        # Initialize with empty list
+        with open(eval_stats_file, 'w') as f:
+            json.dump([], f)
+        print(f"📊 Evaluation stats will be saved to: {eval_stats_file}")
+
     transitions = []
     demo_transitions = []
 
+    print(f"🎯 Actor starting with training env. Calling env.reset()...")
     obs, _ = env.reset()
     done = False
 
     # training loop
     timer = Timer()
     running_return = 0.0
+    episode_length = 0
     already_intervened = False
     intervention_count = 0
     intervention_steps = 0
@@ -155,20 +180,29 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
 
         with timer.context("sample_actions"):
             if step < config.random_steps:
+                # Scale down random actions to avoid wild movements (20% of max range)
                 actions = env.action_space.sample()
+                action_source = "🎲 RANDOM"
             else:
                 sampling_rng, key = jax.random.split(sampling_rng)
                 actions = agent.sample_actions(
                     observations=jax.device_put(obs),
                     seed=key,
-                    argmax=False,
+                    argmax=True,
                 )
-                actions = np.asarray(jax.device_get(actions))
+                actions = np.asarray(jax.device_get(actions), copy=True)
+                action_source = "🤖 AGENT"
+
+        # DETAILED LOGGING: Show action source periodically
+        if step % config.log_period == 0 or step < 10:
+            print(f"\n[Actor Step {step:6d}] {action_source}")
 
         # Step environment
         with timer.context("step_env"):
-
-            next_obs, reward, done, truncated, info = env.step(actions)
+            next_obs, reward, terminated, truncated, info = env.step(actions)
+            done = terminated or truncated
+            episode_length += 1
+            
             if "left" in info:
                 info.pop("left")
             if "right" in info:
@@ -185,35 +219,130 @@ def actor(agent, data_store, intvn_data_store, env, sampling_rng):
                 already_intervened = False
 
             running_return += reward
+            
+            # CRITICAL: masks = 1.0 - terminated (NOT 1.0 - done!)
+            # terminated = True for task completion (bootstrap = 0)
+            # truncated = True for time limit (bootstrap = 1)
             transition = dict(
                 observations=obs,
                 actions=actions,
                 next_observations=next_obs,
                 rewards=reward,
-                masks=1.0 - done,
+                masks=1.0 - float(terminated),  # Correct mask for RLPD
                 dones=done,
             )
+            if transition["masks"] == 0.0:
+                print_green(f"[Actor Step {step:6d}] 🚩 Termination detected. Mask=0.0")
+            
             if 'grasp_penalty' in info:
-                transition['grasp_penalty']= info['grasp_penalty']
+                transition['grasp_penalty'] = info['grasp_penalty']
+            else:
+                transition['grasp_penalty'] = 0.0
+                
             data_store.insert(transition)
             transitions.append(copy.deepcopy(transition))
             if already_intervened:
                 intvn_data_store.insert(transition)
                 demo_transitions.append(copy.deepcopy(transition))
 
-            obs = next_obs
-            if done or truncated:
+            # Log episode termination details
+            if done:
+                is_success = info.get("is_success", False)
+                term_reason = "✅ SUCCESS" if is_success else ("⏱️ TRUNCATED" if truncated else "❌ FAILED")
+                
+                # RecordEpisodeStatistics already added info["episode"] with "r" and "l"
+                # Get stats from RecordEpisodeStatistics
+                ep_return = info["episode"]["r"]
+                ep_length = info["episode"]["l"]
+                ep_last_step_reward = reward
+                
+                print(f"[Actor Step {step:6d}] 🏁 Episode ended → {term_reason}")
+                print(f"                 Episode return: {float(ep_return):.3f}")
+                print(f"                 Episode length: {int(ep_length)} steps")
+                print(f"                 mask={transition['masks']:.1f}, terminated={terminated}, truncated={truncated}\n")
+                print(f"                 Last step reward: {float(ep_last_step_reward):.3f}")
+                print(f"                 Total episode reward accumulated: {running_return:.3f} over {episode_length} steps")
+                # Add custom fields to existing episode dict
+                info["episode"]["is_success"] = is_success
                 info["episode"]["intervention_count"] = intervention_count
                 info["episode"]["intervention_steps"] = intervention_steps
+                
                 stats = {"environment": info}  # send stats to the learner to log
                 client.request("send-stats", stats)
-                pbar.set_description(f"last return: {running_return}")
+                pbar.set_description(f"last return: {float(ep_return):.2f}")
+                
+                # Reset episode tracking
                 running_return = 0.0
+                episode_length = 0
                 intervention_count = 0
                 intervention_steps = 0
                 already_intervened = False
                 client.update()
                 obs, _ = env.reset()
+            else:
+                obs = next_obs
+
+        # Periodic policy evaluation
+        if step > 0 and config.eval_period > 0 and step % config.eval_period == 0:
+            print(f"\n[Actor Step {step:6d}] 🧪 Starting evaluation...")
+            print(f"   Creating fresh eval environment with video recording...")
+            
+            # Create new eval environment with video recording enabled
+            eval_env = config.get_environment(fake_env=False, save_video=True, video_save_path=os.path.join(FLAGS.checkpoint_path, "eval_videos") if FLAGS.checkpoint_path is not None else None, render=True)
+            eval_env = RecordEpisodeStatistics(eval_env)
+            
+            with timer.context("eval"):
+                # Use fixed seed for reproducible evaluation
+                eval_seed = FLAGS.seed + (step // config.eval_period)
+                evaluate_info = evaluate(
+                    policy_fn=partial(agent.sample_actions, argmax=True),
+                    env=eval_env,
+                    num_episodes=FLAGS.eval_n_trajs,
+                    seed=eval_seed,
+                )
+            
+            # Close eval environment to free resources
+            eval_env.close()
+            print(f"   Closed eval environment")
+            
+            # Send stats to learner for WandB logging
+            eval_stats = {"eval": evaluate_info}
+            client.request("send-stats", eval_stats)
+            
+            # Print evaluation results
+            success_rate = evaluate_info.get('final.is_success', 0.0)
+            avg_return = evaluate_info.get('eval/average_return', 0.0)
+            avg_length = evaluate_info.get('eval/average_length', 0)
+            
+            print(f"[Actor Step {step:6d}] ✅ Evaluation complete:")
+            print(f"   • Success rate: {success_rate:.1%}")
+            print(f"   • Avg return: {avg_return:.3f}")
+            print(f"   • Avg length: {avg_length:.1f} steps")
+            
+            # Save to JSON file
+            if eval_stats_file is not None:
+                eval_record = {
+                    "step": step,
+                    "timestamp": datetime.now().isoformat(),
+                    "success_rate": float(success_rate),
+                    "average_return": float(avg_return),
+                    "average_length": float(avg_length),
+                    "full_stats": {k: float(v) if isinstance(v, (np.number, np.floating, np.integer)) else v 
+                                   for k, v in evaluate_info.items()}
+                }
+                
+                # Load existing stats, append new one, save
+                try:
+                    with open(eval_stats_file, 'r') as f:
+                        all_stats = json.load(f)
+                except (json.JSONDecodeError, FileNotFoundError):
+                    all_stats = []
+                all_stats.append(eval_record)
+                with open(eval_stats_file, 'w') as f:
+                    json.dump(all_stats, f, indent=2)
+                print(f"   • Saved stats to: {eval_stats_file}\n")
+            else:
+                print()
 
         if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
             # dump to pickle file
@@ -311,6 +440,14 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
         train_critic_networks_to_update = frozenset({"critic", "grasp_critic"})
         train_networks_to_update = frozenset({"critic", "grasp_critic", "actor", "temperature"})
 
+    # Counters for tracking updates
+    total_critic_only_updates = 0
+    total_critic_actor_updates = 0
+    
+    print_green(f"\n🎯 Starting training with CTA_RATIO={config.cta_ratio}")
+    print_green(f"   • Critic-only updates per step: {config.cta_ratio - 1}")
+    print_green(f"   • Critic+Actor updates per step: 1\n")
+
     for step in tqdm.tqdm(
         range(start_step, config.max_steps), dynamic_ncols=True, desc="learner"
     ):
@@ -318,31 +455,88 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
         # This makes training on GPU faster by reducing the large batch transfer time from CPU to GPU
         for critic_step in range(config.cta_ratio - 1):
             with timer.context("sample_replay_buffer"):
-                batch = next(replay_iterator)
+                online_batch = next(replay_iterator)
                 demo_batch = next(demo_iterator)
-                batch = concat_batches(batch, demo_batch, axis=0)
+                
+                # Log batch construction details periodically
+                if step % config.log_period == 0:
+                    online_size = online_batch['actions'].shape[0]
+                    demo_size = demo_batch['actions'].shape[0]
+                    online_masks = online_batch['masks']
+                    demo_masks = demo_batch['masks']
+                    online_dones = 1.0 - online_masks
+                    demo_dones = 1.0 - demo_masks
+                    
+                    print(f"\n[Step {step:6d}] Critic Update #{critic_step+1}/{config.cta_ratio-1}")
+                    print(f"  Batch Sizes: Online={online_size}, Demo={demo_size}")
+                    print(f"  Online: masks(mean={float(jnp.mean(online_masks)):.3f}, min={float(jnp.min(online_masks)):.3f}, max={float(jnp.max(online_masks)):.3f}) | dones(mean={float(jnp.mean(online_dones)):.3f}, min={float(jnp.min(online_dones)):.3f}, max={float(jnp.max(online_dones)):.3f})")
+                    print(f"  Demo:   masks(mean={float(jnp.mean(demo_masks)):.3f}, min={float(jnp.min(demo_masks)):.3f}, max={float(jnp.max(demo_masks)):.3f}) | dones(mean={float(jnp.mean(demo_dones)):.3f}, min={float(jnp.min(demo_dones)):.3f}, max={float(jnp.max(demo_dones)):.3f})")
+                
+                batch = concat_batches(online_batch, demo_batch, axis=0)
+                
+                if step % config.log_period == 0:
+                    total_size = batch['actions'].shape[0]
+                    print(f"  After Concat: Total={total_size} (should be {online_size + demo_size})")
 
             with timer.context("train_critics"):
                 agent, critics_info = agent.update(
                     batch,
                     networks_to_update=train_critic_networks_to_update,
                 )
+                total_critic_only_updates += 1
 
         with timer.context("train"):
-            batch = next(replay_iterator)
+            online_batch = next(replay_iterator)
             demo_batch = next(demo_iterator)
-            batch = concat_batches(batch, demo_batch, axis=0)
+            
+            # Log batch construction for critic+actor update
+            if step % config.log_period == 0:
+                online_size = online_batch['actions'].shape[0]
+                demo_size = demo_batch['actions'].shape[0]
+                online_masks = online_batch['masks']
+                demo_masks = demo_batch['masks']
+                online_dones = 1.0 - online_masks
+                demo_dones = 1.0 - demo_masks
+                
+                print(f"\n[Step {step:6d}] Critic+Actor Update")
+                print(f"  Batch Sizes: Online={online_size}, Demo={demo_size}")
+                print(f"  Online: masks(mean={float(jnp.mean(online_masks)):.3f}, min={float(jnp.min(online_masks)):.3f}, max={float(jnp.max(online_masks)):.3f}) | dones(mean={float(jnp.mean(online_dones)):.3f}, min={float(jnp.min(online_dones)):.3f}, max={float(jnp.max(online_dones)):.3f})")
+                print(f"  Demo:   masks(mean={float(jnp.mean(demo_masks)):.3f}, min={float(jnp.min(demo_masks)):.3f}, max={float(jnp.max(demo_masks)):.3f}) | dones(mean={float(jnp.mean(demo_dones)):.3f}, min={float(jnp.min(demo_dones)):.3f}, max={float(jnp.max(demo_dones)):.3f})")
+            
+            batch = concat_batches(online_batch, demo_batch, axis=0)
+            
+            if step % config.log_period == 0:
+                total_size = batch['actions'].shape[0]
+                print(f"  After Concat: Total={total_size} (should be {online_size + demo_size})")
+            
             agent, update_info = agent.update(
                 batch,
                 networks_to_update=train_networks_to_update,
             )
+            total_critic_actor_updates += 1
+            
+        # Log update counts periodically
+        if step % config.log_period == 0:
+            update_ratio = total_critic_only_updates / (total_critic_actor_updates + 1e-8)
+            print(f"\n[Step {step:6d}] 📊 Update Counts:")
+            print(f"  Critic-only: {total_critic_only_updates:6d}")
+            print(f"  Critic+Actor: {total_critic_actor_updates:6d}")
+            print(f"  Ratio: {update_ratio:.2f} (expected ~{config.cta_ratio-1:.2f})\n")
+            
         # publish the updated network
         if step > 0 and step % (config.steps_per_update) == 0:
             agent = jax.block_until_ready(agent)
             server.publish_network(agent.state.params)
 
         if step % config.log_period == 0 and wandb_logger:
-            wandb_logger.log(update_info, step=step)
+            # Add update counts to wandb
+            update_info_extended = {
+                **update_info,
+                "training/critic_only_updates": total_critic_only_updates,
+                "training/critic_actor_updates": total_critic_actor_updates,
+                "training/update_ratio": total_critic_only_updates / (total_critic_actor_updates + 1e-8),
+            }
+            wandb_logger.log(update_info_extended, step=step)
             wandb_logger.log({"timer": timer.get_average_times()}, step=step)
 
         if (
@@ -360,18 +554,20 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
 
 def main(_):
     global config
-    config = CONFIG_MAPPING[FLAGS.exp_name]()
+    config = get_config(FLAGS.exp_name)()
 
     assert config.batch_size % num_devices == 0
     # seed
     rng = jax.random.PRNGKey(FLAGS.seed)
     rng, sampling_rng = jax.random.split(rng)
 
-    assert FLAGS.exp_name in CONFIG_MAPPING, "Experiment folder not found."
+    # assert FLAGS.exp_name in CONFIG_MAPPING, "Experiment folder not found."
     env = config.get_environment(
         fake_env=FLAGS.learner,
-        save_video=FLAGS.save_video,
+        save_video=True if FLAGS.eval_checkpoint_step > 0 else False,
         classifier=True,
+        video_save_path=os.path.join(FLAGS.checkpoint_path, "eval_videos") if FLAGS.checkpoint_path is not None else None,
+        render=FLAGS.render,
     )
     env = RecordEpisodeStatistics(env)
 
@@ -385,6 +581,8 @@ def main(_):
             image_keys=config.image_keys,
             encoder_type=config.encoder_type,
             discount=config.discount,
+            critic_ensemble_size=config.critic_ensemble_size,
+            critic_subsample_size=config.critic_subsample_size,
         )
         include_grasp_penalty = False
     elif config.setup_mode == 'single-arm-learned-gripper':
@@ -413,20 +611,25 @@ def main(_):
     # replicate agent across devices
     # need the jnp.array to avoid a bug where device_put doesn't recognize primitives
     agent = jax.device_put(
-        jax.tree_map(jnp.array, agent), sharding.replicate()
+        jax.tree_util.tree_map(jnp.array, agent), sharding.replicate()
     )
 
     if FLAGS.checkpoint_path is not None and os.path.exists(FLAGS.checkpoint_path):
-        input("Checkpoint path already exists. Press Enter to resume training.")
-        ckpt = checkpoints.restore_checkpoint(
-            os.path.abspath(FLAGS.checkpoint_path),
-            agent.state,
-        )
-        agent = agent.replace(state=ckpt)
-        ckpt_number = os.path.basename(
-            checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path))
-        )[11:]
-        print_green(f"Loaded previous checkpoint at step {ckpt_number}.")
+        # Check if there are actual checkpoint files
+        latest_ckpt = checkpoints.latest_checkpoint(os.path.abspath(FLAGS.checkpoint_path))
+        if latest_ckpt is not None:
+            input("Checkpoint path already exists. Press Enter to resume training.")
+            ckpt = checkpoints.restore_checkpoint(
+                os.path.abspath(FLAGS.checkpoint_path),
+                agent.state,
+            )
+            agent = agent.replace(state=ckpt)
+            ckpt_number = os.path.basename(latest_ckpt)[11:]
+            print_green(f"Loaded previous checkpoint at step {ckpt_number}.")
+        else:
+            print_green(f"Checkpoint directory exists but is empty. Starting fresh training.")
+            # Create directory if it doesn't exist
+            os.makedirs(FLAGS.checkpoint_path, exist_ok=True)
 
     def create_replay_buffer_and_wandb_logger():
         replay_buffer = MemoryEfficientReplayBufferDataStore(
@@ -460,8 +663,13 @@ def main(_):
             with open(path, "rb") as f:
                 transitions = pkl.load(f)
                 for transition in transitions:
-                    if 'infos' in transition and 'grasp_penalty' in transition['infos']:
-                        transition['grasp_penalty'] = transition['infos']['grasp_penalty']
+                    # Handle grasp_penalty for hybrid agents
+                    if include_grasp_penalty:
+                        if 'infos' in transition and 'grasp_penalty' in transition['infos']:
+                            transition['grasp_penalty'] = transition['infos']['grasp_penalty']
+                        else:
+                            # For BC demos without grasp_penalty, set to 0 (no penalty)
+                            transition['grasp_penalty'] = 0.0
                     demo_buffer.insert(transition)
         print_green(f"demo buffer size: {len(demo_buffer)}")
         print_green(f"online buffer size: {len(replay_buffer)}")

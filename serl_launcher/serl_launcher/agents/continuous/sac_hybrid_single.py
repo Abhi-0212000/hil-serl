@@ -169,7 +169,9 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
     def critic_loss_fn(self, batch, params: Params, rng: PRNGKey):
         """classes that inherit this class can change this function"""
         batch_size = batch["rewards"].shape[0]
-        # Extract continuous actions for critic
+        # Extract continuous actions for critic (exclude right gripper, last dimension)
+        # For 14D actions: [L_pos(3), L_rot(3), L_grip(1), R_pos(3), R_rot(3), R_grip(1)]
+        # Continuous part: [L_pos, L_rot, L_grip, R_pos, R_rot] = 13D
         actions = batch["actions"][..., :-1]
 
         rng, next_action_sample_key = jax.random.split(rng)
@@ -234,6 +236,8 @@ class SACAgentHybridSingleArm(flax.struct.PyTreeNode):
         """classes that inherit this class can change this function"""
 
         batch_size = batch["rewards"].shape[0]
+        # Extract right gripper action (last dimension of 14D action)
+        # Right gripper is the learned discrete action
         grasp_action = jnp.round(batch["actions"][..., -1]).astype(jnp.int16) + 1 # Cast env action from [-1, 1] to {0, 1, 2}
 
          # Evaluate next grasp Qs for all ensemble members (cheap because we're only doing the forward pass)

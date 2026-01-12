@@ -46,21 +46,66 @@ def add_to(dict_of_lists, single_dict):
         dict_of_lists[k].append(v)
 
 
-def evaluate(policy_fn, env: gym.Env, num_episodes: int) -> Dict[str, float]:
+def evaluate(policy_fn, env: gym.Env, num_episodes: int, seed: int = None) -> Dict[str, float]:
+    """
+    Evaluate policy for num_episodes and return aggregated statistics.
+    
+    Args:
+        policy_fn: Policy function that takes observation and returns action
+        env: Gymnasium environment (should be wrapped with RecordEpisodeStatistics)
+        num_episodes: Number of evaluation episodes
+        seed: Optional seed for reproducible evaluation
+        
+    Returns:
+        Dictionary with averaged statistics including:
+        - eval/average_return: Mean episode return
+        - eval/average_length: Mean episode length
+        - final.is_success: Mean success rate (if env provides is_success in info)
+    """
     stats = defaultdict(list)
-    for _ in range(num_episodes):
-        observation, info = env.reset()
+    episode_returns = []
+    episode_lengths = []
+    
+    for ep_idx in range(num_episodes):
+        # Reset with seed for reproducibility (different seed per episode)
+        reset_seed = seed + ep_idx if seed is not None else None
+        observation, info = env.reset(seed=reset_seed)
         add_to(stats, flatten(info))
+        
         done = False
+        episode_return = 0.0
+        episode_length = 0
+        
         while not done:
             action = policy_fn(observation)
-            observation, _, terminated, truncated, info = env.step(action)
+            observation, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            episode_return += reward
+            episode_length += 1
             add_to(stats, flatten(info))
+        
+        # Track episode stats
+        episode_returns.append(episode_return)
+        episode_lengths.append(episode_length)
         add_to(stats, flatten(info, parent_key="final"))
 
-    for k, v in stats.items():
-        stats[k] = np.mean(v)
+    # Compute means (only for numeric values)
+    for k, v in list(stats.items()):
+        try:
+            # Try to compute mean, skip non-numeric values
+            stats[k] = np.mean(v)
+        except (TypeError, ValueError) as e:
+            # Print and remove non-numeric keys from stats
+            print(f"Skipping non-numeric key '{k}' with values: {v[:3] if len(v) > 3 else v} (error: {e})")
+            del stats[k]
+    
+    # Add summary statistics
+    stats["eval/average_return"] = np.mean(episode_returns)
+    stats["eval/average_length"] = np.mean(episode_lengths)
+    stats["eval/std_return"] = np.std(episode_returns)
+    stats["eval/min_return"] = np.min(episode_returns)
+    stats["eval/max_return"] = np.max(episode_returns)
+    
     return stats
 
 

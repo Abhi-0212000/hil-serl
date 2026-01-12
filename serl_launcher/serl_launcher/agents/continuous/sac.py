@@ -198,10 +198,15 @@ class SACAgent(flax.struct.PyTreeNode):
         critic_loss = jnp.mean((predicted_qs - target_qs) ** 2)
 
         info = {
-            "critic_loss": critic_loss,
+            "critic_loss": critic_loss, # Drop --> Flat Low (e.g., 0.01 - 0.1)
             "predicted_qs": jnp.mean(predicted_qs),
             "target_qs": jnp.mean(target_qs),
             "rewards": batch["rewards"].mean(),
+            "rewards_max": batch["rewards"].max(),
+            "rewards_min": batch["rewards"].min(),
+            "masks": batch["masks"].mean(),
+            "masks_min": batch["masks"].min(),
+            "masks_max": batch["masks"].max(),
         }
 
         return critic_loss, info
@@ -230,8 +235,15 @@ class SACAgent(flax.struct.PyTreeNode):
 
         info = {
             "actor_loss": actor_loss,
+            "acator_objective": actor_objective.mean(),
             "temperature": temperature,
             "entropy": -log_probs.mean(),
+            "predicted_q": predicted_q.mean(),
+            "pi_action_mean": actions.mean(axis=0),  # Mean over batch
+            "pi_action_std": actions.std(axis=0),    # Std over batch
+            "pi_action_position": actions[:, :3],    # ee position
+            "pi_action_orientation": actions[:, 3:6],  # ee orientation in angle-axis
+            "pi_action_gripper": actions[:, 6:],      # gripper action
         }
 
         return actor_loss, info

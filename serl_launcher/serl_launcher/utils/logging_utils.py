@@ -221,3 +221,27 @@ class RecordEpisodeStatistics(gym.Wrapper, gym.utils.RecordConstructorArgs):
             truncations,
             infos,
         )
+
+
+def pretty_print_nested_dict(obs, indent=0):
+    pad = " " * indent
+    print("\n=== Observation Dump ===" if indent == 0 else "")
+    for k, v in obs.items():
+        print(f"\n{pad}Key: {k}")
+        if isinstance(v, dict):
+            print(f"{pad}  Type: dict")
+            # recurse into nested dict
+            pretty_print_nested_dict(v, indent=indent+4)
+        elif isinstance(v, np.ndarray):
+            print(f"{pad}  Type: {type(v)}")
+            print(f"{pad}  Shape: {v.shape}")
+            print(f"{pad}  Dtype: {v.dtype}")
+            if "cam" in k.lower():
+                print(f"{pad}  Values: <skipped for camera data>")
+            else:
+                print(f"{pad}  Values:\n{pad}{v}")
+        else:
+            print(f"{pad}  Type: {type(v)}")
+            print(f"{pad}  Value:\n{pad}{v}")
+    if indent == 0:
+        print("\n========================\n")

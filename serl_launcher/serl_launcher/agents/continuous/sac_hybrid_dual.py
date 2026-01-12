@@ -531,7 +531,11 @@ class SACAgentHybridDualArm(flax.struct.PyTreeNode):
         assert not entropy_per_dim, "Not implemented"
         if target_entropy is None:
             target_entropy = -actions.shape[-1] / 2
-
+            print(f"="*50)
+            print(f"action shape: {actions.shape}")
+            print(f"actions dim: {actions.shape[-1]}")
+            print(f"Setting target entropy to {target_entropy}")
+            print(f"="*50)
         return cls(
             state=state,
             config=dict(
