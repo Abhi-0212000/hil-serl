@@ -50,7 +50,7 @@ flags.DEFINE_string("ip", "localhost", "IP address of the learner.")
 flags.DEFINE_multi_string("demo_path", None, "Path to the demo data.")
 flags.DEFINE_string("checkpoint_path", None, "Path to save checkpoints.")
 flags.DEFINE_integer("eval_checkpoint_step", 0, "Step to evaluate the checkpoint.")
-flags.DEFINE_integer("eval_n_trajs", 5, "Number of trajectories to evaluate.")
+flags.DEFINE_integer("eval_n_trajs", 10, "Number of trajectories to evaluate.")
 flags.DEFINE_boolean("save_video", False, "Save video.")
 flags.DEFINE_boolean("render", True, "Render the environment.")
 
@@ -451,32 +451,62 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
     for step in tqdm.tqdm(
         range(start_step, config.max_steps), dynamic_ncols=True, desc="learner"
     ):
-        # run n-1 critic updates and 1 critic + actor update.
-        # This makes training on GPU faster by reducing the large batch transfer time from CPU to GPU
+        # ========================================================================
+        # CRITIC-ONLY UPDATES (CTA_RATIO - 1 updates)
+        # Purpose: Update value networks without policy changes
+        # ========================================================================
         for critic_step in range(config.cta_ratio - 1):
             with timer.context("sample_replay_buffer"):
                 online_batch = next(replay_iterator)
                 demo_batch = next(demo_iterator)
                 
-                # Log batch construction details periodically
-                if step % config.log_period == 0:
+                # ========================================================================
+                # BATCH COMPOSITION LOGGING (Every log_period steps)
+                # ========================================================================
+                if step % config.log_period == 0 and critic_step == 0:
+                    print(f"\n{'='*80}")
+                    print(f"[LEARNER Step {step:6d}] BATCH ANALYSIS")
+                    print(f"{'='*80}")
+                    
+                    # --- Batch Sizes ---
                     online_size = online_batch['actions'].shape[0]
                     demo_size = demo_batch['actions'].shape[0]
+                    print(f"\n📦 BATCH SIZES:")
+                    print(f"   Online: {online_size:3d} | Demo: {demo_size:3d} | Total: {online_size + demo_size:3d}")
+                    
+                    # --- Camera Images Check ---
+                    # NOTE: SERLObsWrapper unwraps images to top level (not nested under 'images')
+                    print(f"\n📸 CAMERA IMAGES (Verifying all 4 cameras):")
+                    for batch_name, batch_data in [("Online", online_batch), ("Demo", demo_batch)]:
+                        obs = batch_data['observations']
+                        print(f"   {batch_name} batch images:")
+                        cam_count = 0
+                        for cam_name in ['cam_high', 'cam_low', 'cam_left_wrist', 'cam_right_wrist']:
+                            if cam_name in obs:
+                                img_shape = obs[cam_name].shape
+                                img_mean = float(jnp.mean(obs[cam_name]))
+                                img_std = float(jnp.std(obs[cam_name]))
+                                print(f"      ✓ {cam_name:18s}: shape={img_shape}, mean={img_mean:6.2f}, std={img_std:5.2f}")
+                                cam_count += 1
+                            else:
+                                print(f"      ✗ {cam_name:18s}: MISSING!")
+                        print(f"   → {batch_name} total cameras found: {cam_count}/4")
+                    
+                    # --- Masks/Dones Analysis ---
                     online_masks = online_batch['masks']
                     demo_masks = demo_batch['masks']
-                    online_dones = 1.0 - online_masks
-                    demo_dones = 1.0 - demo_masks
+                    print(f"\n🎭 MASKS (Bootstrapping Signal):")
+                    print(f"   Online: mean={float(jnp.mean(online_masks)):.3f}, min={float(jnp.min(online_masks)):.3f}, max={float(jnp.max(online_masks)):.3f}")
+                    print(f"   Demo:   mean={float(jnp.mean(demo_masks)):.3f}, min={float(jnp.min(demo_masks)):.3f}, max={float(jnp.max(demo_masks)):.3f}")
                     
-                    print(f"\n[Step {step:6d}] Critic Update #{critic_step+1}/{config.cta_ratio-1}")
-                    print(f"  Batch Sizes: Online={online_size}, Demo={demo_size}")
-                    print(f"  Online: masks(mean={float(jnp.mean(online_masks)):.3f}, min={float(jnp.min(online_masks)):.3f}, max={float(jnp.max(online_masks)):.3f}) | dones(mean={float(jnp.mean(online_dones)):.3f}, min={float(jnp.min(online_dones)):.3f}, max={float(jnp.max(online_dones)):.3f})")
-                    print(f"  Demo:   masks(mean={float(jnp.mean(demo_masks)):.3f}, min={float(jnp.min(demo_masks)):.3f}, max={float(jnp.max(demo_masks)):.3f}) | dones(mean={float(jnp.mean(demo_dones)):.3f}, min={float(jnp.min(demo_dones)):.3f}, max={float(jnp.max(demo_dones)):.3f})")
+                    # --- Rewards Analysis ---
+                    online_rewards = online_batch['rewards']
+                    demo_rewards = demo_batch['rewards']
+                    print(f"\n🎁 REWARDS:")
+                    print(f"   Online: mean={float(jnp.mean(online_rewards)):.4f}, min={float(jnp.min(online_rewards)):.4f}, max={float(jnp.max(online_rewards)):.4f}")
+                    print(f"   Demo:   mean={float(jnp.mean(demo_rewards)):.4f}, min={float(jnp.min(demo_rewards)):.4f}, max={float(jnp.max(demo_rewards)):.4f}")
                 
                 batch = concat_batches(online_batch, demo_batch, axis=0)
-                
-                if step % config.log_period == 0:
-                    total_size = batch['actions'].shape[0]
-                    print(f"  After Concat: Total={total_size} (should be {online_size + demo_size})")
 
             with timer.context("train_critics"):
                 agent, critics_info = agent.update(
@@ -485,43 +515,42 @@ def learner(rng, agent, replay_buffer, demo_buffer, wandb_logger=None):
                 )
                 total_critic_only_updates += 1
 
+        # ========================================================================
+        # CRITIC + ACTOR UPDATE (1 update per step)
+        # Purpose: Update both value networks AND policy
+        # ========================================================================
         with timer.context("train"):
             online_batch = next(replay_iterator)
             demo_batch = next(demo_iterator)
             
-            # Log batch construction for critic+actor update
-            if step % config.log_period == 0:
-                online_size = online_batch['actions'].shape[0]
-                demo_size = demo_batch['actions'].shape[0]
-                online_masks = online_batch['masks']
-                demo_masks = demo_batch['masks']
-                online_dones = 1.0 - online_masks
-                demo_dones = 1.0 - demo_masks
-                
-                print(f"\n[Step {step:6d}] Critic+Actor Update")
-                print(f"  Batch Sizes: Online={online_size}, Demo={demo_size}")
-                print(f"  Online: masks(mean={float(jnp.mean(online_masks)):.3f}, min={float(jnp.min(online_masks)):.3f}, max={float(jnp.max(online_masks)):.3f}) | dones(mean={float(jnp.mean(online_dones)):.3f}, min={float(jnp.min(online_dones)):.3f}, max={float(jnp.max(online_dones)):.3f})")
-                print(f"  Demo:   masks(mean={float(jnp.mean(demo_masks)):.3f}, min={float(jnp.min(demo_masks)):.3f}, max={float(jnp.max(demo_masks)):.3f}) | dones(mean={float(jnp.mean(demo_dones)):.3f}, min={float(jnp.min(demo_dones)):.3f}, max={float(jnp.max(demo_dones)):.3f})")
-            
             batch = concat_batches(online_batch, demo_batch, axis=0)
-            
-            if step % config.log_period == 0:
-                total_size = batch['actions'].shape[0]
-                print(f"  After Concat: Total={total_size} (should be {online_size + demo_size})")
             
             agent, update_info = agent.update(
                 batch,
                 networks_to_update=train_networks_to_update,
             )
             total_critic_actor_updates += 1
-            
-        # Log update counts periodically
+        
+        # ========================================================================
+        # TRAINING METRICS LOGGING (Every log_period steps)
+        # ========================================================================
         if step % config.log_period == 0:
+            print(f"\n{'='*80}")
+            print(f"[LEARNER Step {step:6d}] TRAINING METRICS")
+            print(f"{'='*80}")
+            
+            # --- Update Counts ---
             update_ratio = total_critic_only_updates / (total_critic_actor_updates + 1e-8)
-            print(f"\n[Step {step:6d}] 📊 Update Counts:")
-            print(f"  Critic-only: {total_critic_only_updates:6d}")
-            print(f"  Critic+Actor: {total_critic_actor_updates:6d}")
-            print(f"  Ratio: {update_ratio:.2f} (expected ~{config.cta_ratio-1:.2f})\n")
+            print(f"\n📊 UPDATE STATISTICS:")
+            print(f"   Critic-only updates: {total_critic_only_updates:7d}")
+            print(f"   Critic+Actor updates: {total_critic_actor_updates:7d}")
+            print(f"   Ratio: {update_ratio:.2f} (expected: {config.cta_ratio-1:.2f})")
+            
+            # --- Buffer Status ---
+            print(f"\n💾 BUFFER STATUS:")
+            print(f"   Replay buffer: {len(replay_buffer):6d} / {replay_buffer._capacity:6d} ({100*len(replay_buffer)/replay_buffer._capacity:.1f}%)")
+            print(f"   Demo buffer:   {len(demo_buffer):6d} / {demo_buffer._capacity:6d} ({100*len(demo_buffer)/demo_buffer._capacity:.1f}%)")
+            print(f"{'='*80}\n")
             
         # publish the updated network
         if step > 0 and step % (config.steps_per_update) == 0:

@@ -7,13 +7,13 @@ from wandb.apis.public.files import Files
 # -----------------------------
 api = wandb.Api()
 
-run_id = "cube_stacking_gym_rlpd_20260108_183911"
+run_id = "cube_stacking_gym_rlpd_20260112_201532"
 project_path = f"/nannuriabhi2000-hochschule-schmalkalden/hil-serl/{run_id}"
 
 run = api.run(project_path)
 
 # Base output directory
-base_dir = f"/home/qte9489/personal_abhi/temp/hil-serl/delta_action_ds/v1/random_cube_pose/cleaned/RL/merged_pkl_data_action_in_world_frame_static_filtered_subsampled_action_shifted_regenerated_deleted_some_clipped_inBbox_fulldelta_act_scaled_act_binarized_epsilon_regenerated_deleted_some/{run_id}"
+base_dir = f"/home/qte9489/personal_abhi/temp/hil-serl/examples/experiments/cube_stacking_gym/RLPD_Checkpoints/trial2/{run_id}"
 os.makedirs(base_dir, exist_ok=True)
 
 print(f"Downloading W&B data for run: {run_id}")

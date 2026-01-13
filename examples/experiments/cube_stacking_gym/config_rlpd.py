@@ -30,7 +30,7 @@ class TrainConfig(DefaultTrainingConfig):
     
     # Replay buffer sizes (reduced to prevent OOM)
     replay_buffer_capacity = 150000  
-    demo_buffer_capacity = 15000     # Reduced from 50k (demos stay in separate buffer)
+    demo_buffer_capacity = 10000     # Reduced from 50k (demos stay in separate buffer)
     
     # Checkpointing
     checkpoint_period = 5000
@@ -40,10 +40,10 @@ class TrainConfig(DefaultTrainingConfig):
     buffer_period: int = 3000
     actor_step_freq: int = 9
     eval_checkpoint_step: int = 0
-    eval_n_trajs: int = 5
-    eval_period = 3000  # Periodic evaluation frequency (0 to disable)
+    eval_n_trajs: int = 10
+    eval_period = 5000  # Periodic evaluation frequency (0 to disable)
 
-    critic_ensemble_size = 10
+    critic_ensemble_size = 5
     critic_subsample_size = 2
 
     # Logging
@@ -71,14 +71,13 @@ class TrainConfig(DefaultTrainingConfig):
                 'cam_right_wrist': (1, 128, 128, 3),
             }
         """
-        
+            
         CONTROL_TIMESTEP = 0.02
         PHYSICS_TIMESTEP = 0.002
-        MAX_EPISODE_LENGTH = 187  # Matches regenerate_ds_state_from_obs() calculation
-        TIME_LIMIT = 20.0
-        
         cam_list = ["cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist"]
-        
+        TIME_LIMIT = 10.0  # seconds
+        MAX_EPISODE_LENGTH = 158
+            
         # Video path setup
         video_path = None
         if save_video:
